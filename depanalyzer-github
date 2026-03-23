@@ -1,0 +1,273 @@
+
+"""depanalyzer-github — Analyse un repo GitHub sans le cloner."""
+
+import sys, os, re, json, shutil, tempfile, argparse, subprocess
+import urllib.request, urllib.error
+from pathlib import Path
+
+LANG_MAP = {
+    'c':          {'.c','.h'},
+    'cpp':        {'.cpp','.cc','.cxx','.hpp','.hxx'},
+    'python':     {'.py','.pyw'},
+    'javascript': {'.js','.jsx','.mjs'},
+    'typescript': {'.ts','.tsx'},
+    'java':       {'.java'},
+    'kotlin':     {'.kt','.kts'},
+    'swift':      {'.swift'},
+    'go':         {'.go'},
+    'rust':       {'.rs'},
+    'ruby':       {'.rb','.rake'},
+    'php':        {'.php','.php3','.php4','.php5'},
+    'lua':        {'.lua'},
+    'dart':       {'.dart'},
+    'r':          {'.r','.R','.Rmd'},
+    'julia':      {'.jl'},
+    'zig':        {'.zig'},
+    'crystal':    {'.cr'},
+    'nim':        {'.nim','.nims','.nimble'},
+    'v':          {'.v','.vv'},
+    'perl':       {'.pl','.pm','.pl6'},
+    'ocaml':      {'.ml','.mli'},
+    'fsharp':     {'.fs','.fsx','.fsi'},
+    'scala':      {'.scala','.sc'},
+    'haskell':    {'.hs','.lhs'},
+    'elixir':     {'.ex','.exs','.heex'},
+    'clojure':    {'.clj','.cljs','.cljc'},
+    'erlang':     {'.erl','.hrl'},
+    'csharp':     {'.cs','.csx'},
+    'groovy':     {'.groovy','.gradle','.gvy'},
+    'powershell': {'.ps1','.psm1','.psd1'},
+    'html':       {'.html','.htm'},
+    'css':        {'.css','.scss','.sass'},
+    'vue':        {'.vue'},
+    'svelte':     {'.svelte'},
+    'json':       {'.json'},
+    'toml':       {'.toml'},
+    'yaml':       {'.yaml','.yml'},
+    'sql':        {'.sql'},
+    'graphql':    {'.graphql','.gql'},
+    'proto':      {'.proto'},
+    'terraform':  {'.tf','.hcl'},
+    'nix':        {'.nix'},
+    'solidity':   {'.sol'},
+    'glsl':       {'.glsl','.vert','.frag','.comp','.wgsl','.hlsl','.metal'},
+    'shell':      {'.sh','.bash','.zsh','.fish'},
+    'assembly':   {'.asm','.s','.S','.nasm'},
+    'cmake':      {'.cmake'},
+    'bazel':      set(),
+    'makefile':   {'.mk'},
+    'dockerfile': {'.dockerfile'},
+    'markdown':   {'.md','.markdown'},
+}
+
+LANG_FILENAMES = {
+    'makefile':   {'Makefile','makefile','GNUmakefile'},
+    'dockerfile': {'Dockerfile','Containerfile'},
+    'cmake':      {'CMakeLists.txt'},
+    'bazel':      {'BUILD','WORKSPACE','BUILD.bazel','WORKSPACE.bazel'},
+    'groovy':     {'Jenkinsfile'},
+}
+
+ALL_EXTENSIONS = set(e for exts in LANG_MAP.values() for e in exts)
+ALL_FILENAMES  = set(f for fns  in LANG_FILENAMES.values() for f in fns)
+
+SKIP_DIRS = {
+    '.git','.github','.gitlab','node_modules','vendor','__pycache__',
+    '.venv','venv','env','.env','dist','build','target','out',
+    '.idea','.vscode','coverage','.nyc_output','__snapshots__',
+}
+
+MAX_FILE_SIZE = 500_000
+MAX_FILES     = 2_000
+
+def gh_headers():
+    token = os.environ.get('GITHUB_TOKEN','')
+    h = {'Accept':'application/vnd.github.v3+json','User-Agent':'depanalyzer-github/1.0'}
+    if token: h['Authorization'] = f'token {token}'
+    return h
+
+def gh_get(url):
+    req = urllib.request.Request(url, headers=gh_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"GitHub API error {e.code}: {e.read().decode()[:200]}")
+
+def raw_get(url):
+    req = urllib.request.Request(url, headers=gh_headers())
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+def parse_github_url(raw):
+    raw = re.sub(r'^https?://','',raw.strip().rstrip('/'))
+    raw = re.sub(r'^github\.com/','',raw)
+    parts = raw.split('/')
+    if len(parts) < 2: raise ValueError(f"Format invalide: {raw!r} — attendu: user/repo")
+    owner = parts[0]
+    repo  = parts[1].removesuffix('.git')
+    branch = parts[3] if len(parts) >= 4 and parts[2]=='tree' else None
+    return owner, repo, branch
+
+def get_default_branch(owner, repo):
+    return gh_get(f'https://api.github.com/repos/{owner}/{repo}').get('default_branch','main')
+
+def get_tree(owner, repo, branch):
+    data = gh_get(f'https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1')
+    if data.get('truncated'):
+        print("⚠  Arbre tronqué (repo très large) — certains fichiers manqueront.", file=sys.stderr)
+    return data.get('tree',[])
+
+def build_filter(lang_list):
+    if not lang_list: return ALL_EXTENSIONS, ALL_FILENAMES
+    exts, names, unknown = set(), set(), []
+    for lang in lang_list:
+        lang = lang.lower()
+        if lang not in LANG_MAP and lang not in LANG_FILENAMES:
+            unknown.append(lang); continue
+        if lang in LANG_MAP:      exts  |= LANG_MAP[lang]
+        if lang in LANG_FILENAMES: names |= LANG_FILENAMES[lang]
+    if unknown:
+        print(f"⚠  Langages inconnus : {', '.join(unknown)}", file=sys.stderr)
+        print(f"   Disponibles : {', '.join(sorted(LANG_MAP.keys()))}", file=sys.stderr)
+    return exts, names
+
+def should_download(blob_path, allowed_exts, allowed_names):
+    parts = blob_path.split('/')
+    for part in parts[:-1]:
+        if part in SKIP_DIRS or part.startswith('.'): return False
+    fname = parts[-1]
+    if fname in allowed_names: return True
+    return Path(fname).suffix.lower() in allowed_exts
+
+def download_files(owner, repo, branch, tree, dest_dir, allowed_exts, allowed_names, max_files):
+    blobs = [i for i in tree
+             if i['type']=='blob'
+             and should_download(i['path'], allowed_exts, allowed_names)
+             and i.get('size',0) <= MAX_FILE_SIZE]
+    if not blobs:
+        print("⚠  Aucun fichier correspondant.", file=sys.stderr); return 0
+    if len(blobs) > max_files:
+        print(f"⚠  {len(blobs)} fichiers trouvés, limité à {max_files}.", file=sys.stderr)
+        blobs = blobs[:max_files]
+    print(f"[2/4] Téléchargement de {len(blobs)} fichier(s)...", file=sys.stderr)
+    base = f'https://raw.githubusercontent.com/{owner}/{repo}/{branch}'
+    downloaded = errors = 0
+    for i, item in enumerate(blobs, 1):
+        path  = item['path']
+        local = Path(dest_dir) / path
+        local.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            local.write_bytes(raw_get(f'{base}/{path}')); downloaded += 1
+        except Exception as e:
+            errors += 1
+            if errors <= 3: print(f"\n      ⚠  {path}: {e}", file=sys.stderr)
+        if i % 50 == 0 or i == len(blobs):
+            end = '\r' if i < len(blobs) else '\n'
+            print(f"      {i}/{len(blobs)} ({int(100*i/len(blobs))}%)", file=sys.stderr, end=end)
+    if errors: print(f"      {errors} erreur(s) ignorée(s).", file=sys.stderr)
+    return downloaded
+
+def find_depanalyzer():
+    here = Path(__file__).resolve().parent
+    for c in [here/'depanalyzer', here/'depanalyzer.exe',
+              Path('/usr/local/bin/depanalyzer'), Path('/usr/bin/depanalyzer')]:
+        if c.exists(): return str(c)
+    found = shutil.which('depanalyzer')
+    if found: return found
+    raise RuntimeError("depanalyzer introuvable. Compilez avec `make` et placez-le ici.")
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Analyse les dépendances d'un repo GitHub sans le cloner.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+EXEMPLES :
+  python depanalyzer-github pallets/flask
+  python depanalyzer-github torvalds/linux --lang c
+  python depanalyzer-github torvalds/linux --lang c python shell
+  python depanalyzer-github vuejs/vue --lang javascript typescript vue
+  python depanalyzer-github user/repo --lang rust --output deps.json --stats
+  python depanalyzer-github user/repo --branch develop --max-files 5000
+  python depanalyzer-github user/repo --list-langs
+  GITHUB_TOKEN=ghp_xxx python depanalyzer-github user/repo
+
+LANGAGES DISPONIBLES (--lang) :
+  c, cpp, python, javascript, typescript, java, kotlin, swift, go, rust,
+  ruby, php, lua, dart, r, julia, zig, crystal, nim, v, perl, ocaml,
+  fsharp, scala, haskell, elixir, csharp, groovy, powershell, html, css,
+  vue, svelte, json, toml, yaml, sql, graphql, proto, terraform, nix,
+  solidity, glsl, shell, assembly, cmake, bazel, makefile, dockerfile, markdown
+        """
+    )
+    p.add_argument('url',                   help='URL GitHub ou user/repo')
+    p.add_argument('--output',   '-o',      help='Fichier JSON de sortie (défaut: stdout)')
+    p.add_argument('--branch',   '-b',      help='Branche (défaut: branche principale)')
+    p.add_argument('--lang',     '-l',      nargs='+', metavar='LANG',
+                   help='Filtrer par langage(s) ex: --lang c python rust')
+    p.add_argument('--stats',               action='store_true',
+                   help='Afficher les statistiques à la fin')
+    p.add_argument('--keep',                action='store_true',
+                   help='Garder les fichiers temporaires après analyse')
+    p.add_argument('--max-files',           type=int, default=MAX_FILES,
+                   help=f'Limite de fichiers (défaut: {MAX_FILES})')
+    p.add_argument('--token',    '-t',      help='GitHub token (ou GITHUB_TOKEN env)')
+    p.add_argument('--list-langs',          action='store_true',
+                   help='Afficher tous les langages disponibles')
+
+    args = p.parse_args()
+
+    if args.list_langs:
+        print("Langages disponibles pour --lang :")
+        for lang in sorted(LANG_MAP.keys()):
+            exts = sorted(LANG_MAP[lang]) + sorted(LANG_FILENAMES.get(lang, set()))
+            print(f"  {lang:<15} {', '.join(exts) or '(noms de fichiers spéciaux)'}")
+        return
+
+    if args.token: os.environ['GITHUB_TOKEN'] = args.token
+
+    try:
+        owner, repo, branch_from_url = parse_github_url(args.url)
+    except ValueError as e:
+        print(f"Erreur: {e}", file=sys.stderr); sys.exit(1)
+
+    branch = args.branch or branch_from_url
+
+    if args.lang:
+        print(f"[0/4] Filtre langages : {', '.join(args.lang)}", file=sys.stderr)
+
+    print(f"[1/4] Récupération de l'arbre: {owner}/{repo}", file=sys.stderr)
+    try:
+        if not branch: branch = get_default_branch(owner, repo)
+        print(f"      Branche: {branch}", file=sys.stderr)
+        tree = get_tree(owner, repo, branch)
+        print(f"      {len(tree)} entrées dans l'arbre", file=sys.stderr)
+    except RuntimeError as e:
+        print(f"Erreur API GitHub: {e}", file=sys.stderr)
+        print("Conseil: définissez GITHUB_TOKEN pour éviter le rate limit.", file=sys.stderr)
+        sys.exit(1)
+
+    allowed_exts, allowed_names = build_filter(args.lang)
+    tmp_dir = tempfile.mkdtemp(prefix=f'depanalyzer_{repo}_')
+    try:
+        n = download_files(owner, repo, branch, tree, tmp_dir,
+                           allowed_exts, allowed_names, args.max_files)
+        if n == 0: print("Aucun fichier téléchargé.", file=sys.stderr); sys.exit(1)
+        print(f"      {n} fichier(s) prêts dans {tmp_dir}", file=sys.stderr)
+
+        cmd = [find_depanalyzer(), tmp_dir]
+        if args.output:  cmd += ['--output', args.output]
+        if args.stats:   cmd.append('--stats')
+
+        print(f"[3/4] Analyse avec depanalyzer...", file=sys.stderr)
+        result = subprocess.run(cmd)
+        if result.returncode != 0: sys.exit(result.returncode)
+
+        print(f"[4/4] Terminé ✓", file=sys.stderr)
+        if args.output: print(f"      Résultat: {args.output}", file=sys.stderr)
+    finally:
+        if not args.keep: shutil.rmtree(tmp_dir, ignore_errors=True)
+        else: print(f"      Fichiers conservés: {tmp_dir}", file=sys.stderr)
+
+if __name__ == '__main__':
+    main()
