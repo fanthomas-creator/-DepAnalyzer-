@@ -26,7 +26,7 @@ depanalyzer ./my_project --output deps.json
 depanalyzer ./my_project --output deps.json --stats
 ```
 
-## Analyze a GitHub repo (no clone needed)
+## Analyze a GitHub epo (no clone neded)
 
 ```bash
 # Requires Python 3.8+
